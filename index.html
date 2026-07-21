@@ -14,8 +14,7 @@
     <div id="loginPage" class="login-container">
         <div class="login-card">
             <div class="login-header">
-                <h2>IOT-Based-Smart-Automated-Agro-Farm-Shed
-</h2>
+                <h2>IOT-Based-Smart-Automated-Agro-Farm-Shed</h2>
                 <p>Admin Authentication Required</p>
             </div>
             <div id="loginError" class="error-msg" style="display: none;"></div>
@@ -44,6 +43,7 @@
             <div class="nav-controls">
                 <button class="nav-tab active" data-page="dashboard">📊 Dashboard</button>
                 <button class="nav-tab" data-page="records">📈 Historical Records</button>
+                <button id="alarmSoundBtn" class="nav-tab">🔇 Alarm: OFF</button>
                 <button id="theme-toggle" class="theme-btn">☀️ Light Mode</button>
                 <div class="admin-badge">
                     👤 <span id="adminEmailDisplay">Admin</span>
@@ -64,12 +64,18 @@
             <div class="status-item">
                 <span>📡 Total Commands: <strong id="stat-cmds">0</strong></span>
             </div>
-            <div class="status-item" style="margin-left: auto; display: flex; gap: 10px; align-items: center;">
-                <span>⚡ Grid Route:</span>
-                <button id="powerSourceBtn" class="power-btn solar">☀️ Source: SOLAR</button>
-                <span style="font-size: 0.75rem; color: var(--text-muted);">
-                    (Solar: <strong id="solarCount" style="color:var(--text-main)">0</strong> | AC: <strong id="acCount" style="color:var(--text-main)">0</strong>)
-                </span>
+            <div class="status-item" style="margin-left: auto; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                <span>⚡ Active Grid Route:</span>
+                <button id="powerSourceBtn" class="power-btn solar">☀️ Solar Power ☀️</button>
+                
+                <!-- ☀️ Solar Runtime Display Badge -->
+                <div class="solar-timer-badge">
+                    ☀️ Solar Runtime: <strong id="solarTimerDisplay">0h 0m 0s</strong>
+                </div>
+                <!-- 🔌 AC Runtime Display Badge -->
+                <div class="ac-timer-badge">
+                    🔌 AC Runtime: <strong id="acTimerDisplay">0h 0m 0s</strong>
+                </div>
             </div>
         </div>
 
@@ -91,7 +97,7 @@
             <section class="section-block">
                 <h3>🎮 Device & Actuator Control Buttons</h3>
                 <div id="actuatorsPanel" class="actuators-grid">
-                    <!-- Loaded dynamically via script.js -->
+                    <!-- DOM Structure Built ONCE via script.js to guarantee instant 1-click action -->
                 </div>
             </section>
 
@@ -108,7 +114,7 @@
                 </div>
             </section>
 
-            <!-- Activity & Power Logs -->
+            <!-- Activity & Power Grid Log Timelines -->
             <section class="section-block">
                 <h3>📝 System Logs & Grid Routing History</h3>
                 <div class="split-grid">
@@ -140,7 +146,10 @@
             <section class="section-block">
                 <div class="section-header">
                     <h3>📊 All-Time Sensor Analytics & Extremes</h3>
-                    <button id="resetRecordsPageBtn" class="danger-btn">⚠️ Reset All Historical Data</button>
+                    <div style="display: flex; gap: 10px;">
+                        <button id="exportCsvBtn" class="ctrl-btn active">📥 Export CSV Data</button>
+                        <button id="resetRecordsPageBtn" class="danger-btn">⚠️ Reset All Historical Data</button>
+                    </div>
                 </div>
                 <div id="recordsFullGrid" class="records-full-grid">
                     <!-- Loaded dynamically via script.js -->
