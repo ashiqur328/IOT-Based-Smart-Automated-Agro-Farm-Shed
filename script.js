@@ -17,15 +17,22 @@ const app = initializeApp(firebaseConfig);
 const db = getDatabase(app);
 const auth = getAuth(app);
 
-// ─── ⚡ ZERO-LATENCY OPTIMISTIC UI LOCKOUT MATRIX ────────────────
 const pendingCommands = new Set();
 let totalCommands = 0;
 const MAX_CHART_POINTS = 30;
 let recordHistory = [], powerHistory = [];
-let currentPowerSource = "SOLAR"; 
-let powerCounters = { solar: 0, ac: 0 };
+let currentPowerSource = null; 
 let climateChart, envChart;
 let isDataListenerActive = false;
+let currentActuatorData = {};
+
+let audioAlarmEnabled = false;
+let lastAudioAlertTime = 0;
+
+// Watchdog & Offline State Variables
+let lastDataReceivedTimestamp = 0;
+let offlineWatchdogTimer = null;
+let isEsp32CurrentlyOffline = false;
 
 let globalCounters = { tempCount: 0, tempSum: 0, humCount: 0, humSum: 0, rainCount: 0, rainSum: 0, gasCount: 0, gasSum: 0, lightCount: 0, lightSum: 0 };
 let allTimeRecords = {
@@ -44,12 +51,19 @@ const previewGrid = document.getElementById('previewGrid');
 const recordsFullGrid = document.getElementById('recordsFullGrid');
 const historyTimeline = document.getElementById('historyTimeline');
 const powerSourceBtn = document.getElementById('powerSourceBtn');
-const solarCountEl = document.getElementById('solarCount');
-const acCountEl = document.getElementById('acCount');
+const solarTimerDisplay = document.getElementById('solarTimerDisplay');
+const acTimerDisplay = document.getElementById('acTimerDisplay');
 const powerHistoryTimeline = document.getElementById('powerHistoryTimeline');
 
 const safeNum = (val) => (typeof val === 'number' && isFinite(val)) ? val : 0;
 const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
+
+function formatSolarTime(totalSeconds) {
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    return `${hours}h ${minutes}m ${seconds}s`;
+}
 
 function initAuthSystem() {
     onAuthStateChanged(auth, (user) => {
@@ -108,6 +122,75 @@ function initAuthSystem() {
     }
 }
 
+function initAudioSystem() {
+    const alarmBtn = document.getElementById('alarmSoundBtn');
+    if (!alarmBtn) return;
+    
+    alarmBtn.addEventListener('click', () => {
+        audioAlarmEnabled = !audioAlarmEnabled;
+        alarmBtn.innerText = audioAlarmEnabled ? '🔔 Alarm: ACTIVE' : '🔇 Alarm: OFF';
+        alarmBtn.classList.toggle('active', audioAlarmEnabled);
+        showToast(audioAlarmEnabled ? "Audio Alarms Enabled 🔔" : "Audio Alarms Muted 🔇");
+        
+        if (audioAlarmEnabled) playBeep(880, 0.15); 
+    });
+}
+
+function playBeep(freq = 750, duration = 0.3) {
+    if (!audioAlarmEnabled) return;
+    try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) return;
+        const ctx = new AudioCtx();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(freq, ctx.currentTime);
+        gain.gain.setValueAtTime(0.15, ctx.currentTime);
+        
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        
+        osc.start();
+        osc.stop(ctx.currentTime + duration);
+    } catch (e) {
+        console.error("Audio API error", e);
+    }
+}
+
+function exportTelemetryCSV() {
+    let csvContent = "data:text/csv;charset=utf-8,";
+    csvContent += "SMARTSHED TELEMETRY EXPORT REPORT\n";
+    csvContent += `Generated Date: ${new Date().toLocaleString()}\n\n`;
+    
+    csvContent += "Sensor Metric,Min Reading,Max Reading,Rolling Average,Max Recorded Time\n";
+    for (const [key, val] of Object.entries(allTimeRecords)) {
+        csvContent += `${key.toUpperCase()},${val.min},${val.max},${val.avg.toFixed(2)},"${val.maxTime}"\n`;
+    }
+    
+    csvContent += `\nPower Grid Metrics,Current Active Source: ${currentPowerSource}\n`;
+    
+    csvContent += "\nHistorical Extreme Event Logs\n";
+    csvContent += "Timestamp,Event Details\n";
+    if (recordHistory && recordHistory.length > 0) {
+        recordHistory.forEach(item => {
+            csvContent += `"${item.timestamp}","${item.type}: ${item.value}"\n`;
+        });
+    }
+
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `smartshed_analytics_${new Date().toISOString().slice(0, 10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    
+    showToast("📥 CSV Report Downloaded!");
+    addLog("System Action: Historical telemetry report exported to CSV.");
+}
+
 function addLog(msg) {
     if (!activityLogDiv) return;
     const entry = document.createElement('div');
@@ -118,74 +201,96 @@ function addLog(msg) {
     if (activityLogDiv.children.length > 35) activityLogDiv.removeChild(activityLogDiv.lastChild);
 }
 
+function addPowerLog(msg) {
+    if (!powerHistoryTimeline) return;
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    
+    const entry = document.createElement('div');
+    entry.className = 'log-entry';
+    entry.innerHTML = `<span class="log-time">${time}</span><span>${msg}</span>`;
+    powerHistoryTimeline.prepend(entry);
+    if (powerHistoryTimeline.children.length > 35) powerHistoryTimeline.removeChild(powerHistoryTimeline.lastChild);
+
+    powerHistory.unshift({ msg, timestamp: time });
+    if (powerHistory.length > 35) powerHistory.pop();
+    localStorage.setItem('power_grid_history', JSON.stringify(powerHistory));
+}
+
+function renderSavedPowerLogs() {
+    if (!powerHistoryTimeline) return;
+    powerHistoryTimeline.innerHTML = '';
+    if (powerHistory.length === 0) {
+        powerHistoryTimeline.innerHTML = `<div class="log-entry"><span class="log-time">--:--</span><span>Grid history logging active...</span></div>`;
+        return;
+    }
+    powerHistory.forEach(item => {
+        const entry = document.createElement('div');
+        entry.className = 'log-entry';
+        entry.innerHTML = `<span class="log-time">${item.timestamp}</span><span>${item.msg}</span>`;
+        powerHistoryTimeline.appendChild(entry);
+    });
+}
+
 function showToast(msg, isError = false) {
     const toast = document.createElement('div');
     Object.assign(toast.style, {
         position: 'fixed', bottom: '25px', right: '25px',
-        background: isError ? 'var(--danger)' : 'var(--accent)',
-        color: 'white', padding: '12px 24px', borderRadius: '10px',
-        fontSize: '0.85rem', zIndex: '99999', fontWeight: '600',
-        boxShadow: '0 10px 15px rgba(0,0,0,0.3)', transition: 'all 0.3s ease'
+        background: isError ? '#ef4444' : 'var(--accent)',
+        color: 'white', padding: '14px 24px', borderRadius: '10px',
+        fontSize: '0.9rem', zIndex: '99999', fontWeight: '600',
+        boxShadow: '0 10px 20px rgba(0,0,0,0.4)', transition: 'all 0.3s ease',
+        borderLeft: isError ? '6px solid #7f1d1d' : '6px solid #1e3a8a'
     });
     toast.innerText = msg; document.body.appendChild(toast);
-    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 2200);
+    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 3000);
 }
 
-function loadPowerSystem() {
-    const savedSource = localStorage.getItem('power_current_source');
-    const savedCounters = localStorage.getItem('power_counters');
-    const savedPowerHistory = localStorage.getItem('power_history_logs');
-    if (savedSource) currentPowerSource = savedSource;
-    if (savedCounters) powerCounters = JSON.parse(savedCounters);
-    if (savedPowerHistory) powerHistory = JSON.parse(savedPowerHistory);
-    updatePowerUI();
-}
+function updatePowerUI(powerData) {
+    if (!powerData) return;
+    
+    const sourceStr = powerData.source || "AC Power 🔌";
+    const isSolar = sourceStr.includes("Solar");
 
-function togglePowerSource() {
-    const now = new Date();
-    const timeStr = now.toLocaleDateString() + ' ' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    if (currentPowerSource === "SOLAR") {
-        currentPowerSource = "AC"; powerCounters.ac++;
-        powerHistory.unshift({ source: "AC Grid Power", time: timeStr, icon: "🔌", color: "var(--ac)" });
-    } else {
-        currentPowerSource = "SOLAR"; powerCounters.solar++;
-        powerHistory.unshift({ source: "Solar PV Array", time: timeStr, icon: "☀️", color: "var(--solar)" });
+    if (currentPowerSource !== null && currentPowerSource !== sourceStr) {
+        addPowerLog(`Grid Switch: Routing active on ${sourceStr}`);
+        showToast(`⚡ Power Grid Switched to ${sourceStr}`);
     }
-    if (powerHistory.length > 20) powerHistory.pop();
-    localStorage.setItem('power_current_source', currentPowerSource);
-    localStorage.setItem('power_counters', JSON.stringify(powerCounters));
-    localStorage.setItem('power_history_logs', JSON.stringify(powerHistory));
-    updatePowerUI();
-    showToast(`Power Grid Router Updated!`);
-}
+    currentPowerSource = sourceStr;
 
-function updatePowerUI() {
-    if (solarCountEl) solarCountEl.innerText = powerCounters.solar; 
-    if (acCountEl) acCountEl.innerText = powerCounters.ac;
     if (powerSourceBtn) {
-        powerSourceBtn.innerText = currentPowerSource === "SOLAR" ? "☀️ Source: SOLAR" : "🔌 Source: AC MAINS";
-        powerSourceBtn.className = `power-btn ${currentPowerSource.toLowerCase()}`;
+        powerSourceBtn.innerText = isSolar ? "☀️ Source: SOLAR POWER" : "🔌 Source: AC MAINS";
+        powerSourceBtn.className = `power-btn ${isSolar ? 'solar' : 'ac'}`;
     }
-    if (!powerHistoryTimeline) return;
-    powerHistoryTimeline.innerHTML = powerHistory.map(log => `
-        <div class="log-entry" style="justify-content:space-between;">
-            <span style="color:${log.color}; font-weight:600">${log.icon} ${log.source} Locked</span>
-            <span style="color:var(--text-muted); font-size:0.75rem;">${log.time}</span>
-        </div>
-    `).join('');
+
+    if (solarTimerDisplay) {
+        const sec = safeNum(powerData.solarRuntimeSec);
+        solarTimerDisplay.innerText = formatSolarTime(sec);
+    }
+
+    if (acTimerDisplay) {
+        const sec = safeNum(powerData.acRuntimeSec);
+        acTimerDisplay.innerText = formatSolarTime(sec);
+    }
 }
 
 function loadHistoricalRecords() {
     const storedRecords = localStorage.getItem('all_time_sensor_records');
     const storedCounters = localStorage.getItem('global_math_counters');
     const storedHistory = localStorage.getItem('record_history_timeline');
+    const storedPowerLogs = localStorage.getItem('power_grid_history');
+
     if (storedRecords) allTimeRecords = JSON.parse(storedRecords);
     if (storedCounters) globalCounters = JSON.parse(storedCounters);
     if (storedHistory) recordHistory = JSON.parse(storedHistory);
+    if (storedPowerLogs) powerHistory = JSON.parse(storedPowerLogs);
+
+    renderSavedPowerLogs();
     updateAllUI();
 }
 
 function processSensorHistory(key, value, label, unit) {
+    if (isEsp32CurrentlyOffline || value === 0) return; // Do not mix zero-resets into min/max records
+
     const now = new Date();
     const dateStr = now.toLocaleDateString() + ' ' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     let isUpdated = false;
@@ -276,15 +381,18 @@ function switchToRecordsPage() {
     document.getElementById('recordsPage')?.classList.add('active');
     document.getElementById('dashboardPage')?.classList.remove('active');
     document.querySelectorAll('.nav-tab').forEach(t => t.classList.toggle('active', t.dataset.page === 'records'));
-    updateAllUI(); updatePowerUI();
+    updateAllUI();
 }
 
 function initNavigation() {
-    document.querySelectorAll('.nav-tab').forEach(t => t.addEventListener('click', (e) => { if (e.target.dataset.page === 'dashboard') switchToDashboard(); else switchToRecordsPage(); }));
+    document.querySelectorAll('.nav-tab').forEach(t => t.addEventListener('click', (e) => { 
+        if (e.target.dataset.page === 'dashboard') switchToDashboard(); 
+        else if (e.target.dataset.page === 'records') switchToRecordsPage(); 
+    }));
     document.getElementById('homeLogoBtn')?.addEventListener('click', switchToDashboard);
     document.getElementById('gotoRecordsBtn')?.addEventListener('click', switchToRecordsPage);
     document.getElementById('resetRecordsPageBtn')?.addEventListener('click', resetAllRecords);
-    if (powerSourceBtn) powerSourceBtn.addEventListener('click', togglePowerSource);
+    document.getElementById('exportCsvBtn')?.addEventListener('click', exportTelemetryCSV);
 }
 
 function initTheme() {
@@ -311,52 +419,74 @@ function renderSensors(data) {
             const val = safeNum(s.value);
             const ratio = clamp((val / s.max) * 100, 0, 100);
             const warn = (s.warn && val > s.warn) ? 'warn' : 'ok';
-            return `<div class="sensor-card">
-                        <div class="sensor-header"><span>${s.icon} ${s.label}</span><span class="sensor-badge ${warn}">${warn.toUpperCase()}</span></div>
-                        <div class="sensor-value">${val.toFixed(1)}<span class="sensor-unit">${s.unit}</span></div>
-                        <div class="progress-bar"><div class="progress-fill" style="width:${ratio}%; background:${warn === 'warn' ? 'var(--danger)' : 'var(--success)'};"></div></div>
+            return `<div class="sensor-card ${isEsp32CurrentlyOffline ? 'sensor-offline' : ''}">
+                        <div class="sensor-header"><span>${s.icon} ${s.label}</span><span class="sensor-badge ${isEsp32CurrentlyOffline ? 'warn' : warn}">${isEsp32CurrentlyOffline ? 'OFFLINE' : warn.toUpperCase()}</span></div>
+                        <div class="sensor-value" style="${isEsp32CurrentlyOffline ? 'color:#ef4444;' : ''}">${val.toFixed(1)}<span class="sensor-unit">${s.unit}</span></div>
+                        <div class="progress-bar"><div class="progress-fill" style="width:${ratio}%; background:${isEsp32CurrentlyOffline ? '#ef4444' : (warn === 'warn' ? 'var(--danger)' : 'var(--success)')};"></div></div>
                     </div>`;
         }).join('');
     }
 }
 
-// ─── 🟢 DYNAMIC ACTUATOR & WATER SPRAY SERVO PANEL ─────────────────
-function updateDeviceControls(data) {
+function initActuatorsPanelOnce() {
     if (!actuatorsPanel) return;
-    
-    // Do NOT redraw controls if user is actively clicking a button (prevents flicker)
-    if (pendingCommands.size > 0) return;
-
-    const systems = [
-        { path: 'actuators/fan1', autoPath: 'automation/autoFan1', label: 'Ceiling Fan', icon: '🌀', val: !!data.fan1, auto: !!data.autoFan1 },
-        { path: 'actuators/fan2', autoPath: 'automation/autoFan2', label: 'Exhaust Fan', icon: '🌬️', val: !!data.fan2, auto: !!data.autoFan2 },
-        { path: 'actuators/heatlight', autoPath: 'automation/autoHeat', label: 'Heat Lamp', icon: '☀️', val: !!data.heatlight, auto: !!data.autoHeat },
-        { path: 'actuators/nightlight', autoPath: 'automation/autoNightLight', label: 'Night Light', icon: '🌙', val: !!data.nightlight, auto: !!data.autoNightLight },
-       
-    ];
-
-    actuatorsPanel.innerHTML = systems.map(s => `
+    actuatorsPanel.innerHTML = `
         <div class="device-item">
             <div class="device-info">
-                <div class="device-icon">${s.icon}</div>
+                <div class="device-icon">🌀</div>
                 <div>
-                    <div class="device-title">${s.label}</div>
-                    <div class="device-sub">${s.auto ? '🤖 AUTO MODE' : '✋ MANUAL MODE'}</div>
+                    <div class="device-title">Ceiling Fan</div>
+                    <div class="device-sub" id="sub-fan1">🤖 AUTO MODE</div>
                 </div>
             </div>
             <div class="button-group">
-                <button class="ctrl-btn ${s.auto ? 'active' : ''}" onclick="window.toggleFirebaseFlag('${s.autoPath}', ${!s.auto}, this, 'auto')">
-                    ${s.auto ? 'Auto ON' : 'Auto OFF'}
-                </button>
-                <button class="ctrl-btn ${s.val ? 'on' : ''}" ${s.auto ? 'disabled style="opacity:0.5; cursor:not-allowed;"' : ''} onclick="window.toggleFirebaseFlag('${s.path}', ${!s.val}, this, 'pwr')">
-                    ${s.val ? 'PWR ON' : 'PWR OFF'}
-                </button>
+                <button id="auto-fan1-btn" class="ctrl-btn">Auto OFF</button>
+                <button id="pwr-fan1-btn" class="ctrl-btn">PWR OFF</button>
             </div>
         </div>
-    `).join('');
 
-    // --- Standalone Devices: Pump & Automated Water Spray Servo ---
-    actuatorsPanel.innerHTML += `
+        <div class="device-item">
+            <div class="device-info">
+                <div class="device-icon">🌬️</div>
+                <div>
+                    <div class="device-title">Exhaust Fan</div>
+                    <div class="device-sub" id="sub-fan2">🤖 AUTO MODE</div>
+                </div>
+            </div>
+            <div class="button-group">
+                <button id="auto-fan2-btn" class="ctrl-btn">Auto OFF</button>
+                <button id="pwr-fan2-btn" class="ctrl-btn">PWR OFF</button>
+            </div>
+        </div>
+
+        <div class="device-item">
+            <div class="device-info">
+                <div class="device-icon">☀️</div>
+                <div>
+                    <div class="device-title">Heat Lamp</div>
+                    <div class="device-sub" id="sub-heatlight">🤖 AUTO MODE</div>
+                </div>
+            </div>
+            <div class="button-group">
+                <button id="auto-heatlight-btn" class="ctrl-btn">Auto OFF</button>
+                <button id="pwr-heatlight-btn" class="ctrl-btn">PWR OFF</button>
+            </div>
+        </div>
+
+        <div class="device-item">
+            <div class="device-info">
+                <div class="device-icon">🌙</div>
+                <div>
+                    <div class="device-title">Night Light</div>
+                    <div class="device-sub" id="sub-nightlight">🤖 AUTO MODE</div>
+                </div>
+            </div>
+            <div class="button-group">
+                <button id="auto-nightlight-btn" class="ctrl-btn">Auto OFF</button>
+                <button id="pwr-nightlight-btn" class="ctrl-btn">PWR OFF</button>
+            </div>
+        </div>
+
         <div class="device-item">
             <div class="device-info">
                 <div class="device-icon">🚰</div>
@@ -366,70 +496,175 @@ function updateDeviceControls(data) {
                 </div>
             </div>
             <div style="width: 150px; flex-shrink: 0;">
-                <button class="pump-btn ${data.pump ? 'on' : ''}" onclick="window.toggleFirebaseFlag('actuators/pump', ${!data.pump}, this, 'pump')">
-                    ${data.pump ? 'PUMP RUNNING' : 'START PUMP'}
-                </button>
+                <button id="pump-btn" class="pump-btn">START PUMP</button>
             </div>
         </div>
 
-        <!-- 🟢 WATER SPRAY SERVO (AUTO LOW-HUMIDITY + MANUAL TRIGGER) -->
         <div class="device-item" style="border: 1px solid var(--accent); background: rgba(59, 130, 246, 0.05);">
             <div class="device-info">
                 <div class="device-icon" style="background: rgba(59, 130, 246, 0.2);">💦</div>
                 <div>
-                    <div class="device-title" style="color: var(--accent);">Water Spray Servo </div>
-                    <div class="device-sub">${data.autoSpray ? '🤖 AUTO: SPRAYS IF HUMIDITY < 30%' : '✋ MANUAL OVERRIDE'}</div>
+                    <div class="device-title" style="color: var(--accent);">Water Spray Servo</div>
+                    <div class="device-sub" id="sub-spray">🤖 AUTO MODE</div>
                 </div>
             </div>
             <div class="button-group" style="width: auto; gap: 8px;">
-                <button class="ctrl-btn ${data.autoSpray ? 'active' : ''}" onclick="window.toggleFirebaseFlag('automation/autoSpray', ${!data.autoSpray}, this, 'auto')">
-                    ${data.autoSpray ? 'Auto ON' : 'Auto OFF'}
-                </button>
-                <button class="pump-btn ${data.spray ? 'on' : ''}" id="sprayBtn" style="padding: 10px 16px;" ${data.spray ? 'disabled' : ''} onclick="window.triggerWaterSprayServo(this)">
-                    ${data.spray ? '💦 SPRAYING...' : 'Click Manual Water SPRAY'}
-                </button>
+                <button id="auto-spray-btn" class="ctrl-btn">Auto OFF</button>
+                <button id="sprayBtn" class="pump-btn" style="padding: 10px 16px;">Click Manual Water SPRAY</button>
             </div>
         </div>
 
-        <!-- Automated Curtains -->
         <div class="device-item" style="grid-column: 1 / -1;">
             <div class="device-info">
                 <div class="device-icon">🪟</div>
                 <div>
                     <div class="device-title">Automated Shed Curtains</div>
-                    <div class="device-sub">${data.autoCurtain ? '🤖 AUTO MODE ACTIVE' : '✋ MANUAL OVERRIDE'}</div>
+                    <div class="device-sub" id="sub-curtain">🤖 AUTO MODE</div>
                 </div>
             </div>
             <div class="button-group">
-                <button class="ctrl-btn ${data.autoCurtain ? 'active' : ''}" onclick="window.toggleFirebaseFlag('automation/autoCurtain', ${!data.autoCurtain}, this, 'auto')">
-                    ${data.autoCurtain ? 'Auto ON' : 'Auto OFF'}
-                </button>
-                <button class="ctrl-btn ${data.curtainStatus === 1 ? 'on' : ''}" ${data.autoCurtain ? 'disabled style="opacity:0.5"' : ''} onclick="window.setCurtainState(1, this)">
-                    ▲ Open Curtains
-                </button>
-                <button class="ctrl-btn ${data.curtainStatus === 0 ? 'on' : ''}" ${data.autoCurtain ? 'disabled style="opacity:0.5"' : ''} onclick="window.setCurtainState(0, this)">
-                    ▼ Close Curtains
-                </button>
+                <button id="auto-curtain-btn" class="ctrl-btn">Auto OFF</button>
+                <button id="curtain-open-btn" class="ctrl-btn">▲ Open Curtains</button>
+                <button id="curtain-close-btn" class="ctrl-btn">▼ Close Curtains</button>
             </div>
         </div>
     `;
+
+    bindActuatorEventsOnce();
 }
 
-// ─── ⚡ ZERO-LATENCY EXPORTED FIREBASE ACTIONS ──────────────────────
+function bindActuatorEventsOnce() {
+    document.getElementById('auto-fan1-btn')?.addEventListener('click', function() {
+        window.toggleFirebaseFlag('automation/autoFan1', !currentActuatorData.autoFan1, this, 'auto');
+    });
+    document.getElementById('pwr-fan1-btn')?.addEventListener('click', function() {
+        window.toggleFirebaseFlag('actuators/fan1', !currentActuatorData.fan1, this, 'pwr');
+    });
+
+    document.getElementById('auto-fan2-btn')?.addEventListener('click', function() {
+        window.toggleFirebaseFlag('automation/autoFan2', !currentActuatorData.autoFan2, this, 'auto');
+    });
+    document.getElementById('pwr-fan2-btn')?.addEventListener('click', function() {
+        window.toggleFirebaseFlag('actuators/fan2', !currentActuatorData.fan2, this, 'pwr');
+    });
+
+    document.getElementById('auto-heatlight-btn')?.addEventListener('click', function() {
+        window.toggleFirebaseFlag('automation/autoHeat', !currentActuatorData.autoHeat, this, 'auto');
+    });
+    document.getElementById('pwr-heatlight-btn')?.addEventListener('click', function() {
+        window.toggleFirebaseFlag('actuators/heatlight', !currentActuatorData.heatlight, this, 'pwr');
+    });
+
+    document.getElementById('auto-nightlight-btn')?.addEventListener('click', function() {
+        window.toggleFirebaseFlag('automation/autoNightLight', !currentActuatorData.autoNightLight, this, 'auto');
+    });
+    document.getElementById('pwr-nightlight-btn')?.addEventListener('click', function() {
+        window.toggleFirebaseFlag('actuators/nightlight', !currentActuatorData.nightlight, this, 'pwr');
+    });
+
+    document.getElementById('pump-btn')?.addEventListener('click', function() {
+        window.toggleFirebaseFlag('actuators/pump', !currentActuatorData.pump, this, 'pump');
+    });
+
+    document.getElementById('auto-spray-btn')?.addEventListener('click', function() {
+        window.toggleFirebaseFlag('automation/autoSpray', !currentActuatorData.autoSpray, this, 'auto');
+    });
+    document.getElementById('sprayBtn')?.addEventListener('click', function() {
+        window.triggerWaterSprayServo(this);
+    });
+
+    document.getElementById('auto-curtain-btn')?.addEventListener('click', function() {
+        window.toggleFirebaseFlag('automation/autoCurtain', !currentActuatorData.autoCurtain, this, 'auto');
+    });
+    document.getElementById('curtain-open-btn')?.addEventListener('click', function() {
+        window.setCurtainState(1, this);
+    });
+    document.getElementById('curtain-close-btn')?.addEventListener('click', function() {
+        window.setCurtainState(0, this);
+    });
+}
+
+function updateDeviceControls(data) {
+    currentActuatorData = data;
+    if (pendingCommands.size > 0) return;
+
+    const updateDeviceUI = (key, autoKey, subId, autoBtnId, pwrBtnId) => {
+        const isAuto = !!data[autoKey];
+        const isPwr = !!data[key];
+
+        const sub = document.getElementById(subId);
+        if (sub) sub.innerText = isAuto ? '🤖 AUTO MODE' : '✋ MANUAL MODE';
+
+        const autoBtn = document.getElementById(autoBtnId);
+        if (autoBtn) {
+            autoBtn.classList.toggle('active', isAuto);
+            autoBtn.innerText = isAuto ? 'Auto ON' : 'Auto OFF';
+        }
+
+        const pwrBtn = document.getElementById(pwrBtnId);
+        if (pwrBtn) {
+            pwrBtn.classList.toggle('on', isPwr);
+            pwrBtn.innerText = isPwr ? 'PWR ON' : 'PWR OFF';
+            pwrBtn.disabled = isAuto;
+            pwrBtn.style.opacity = isAuto ? '0.5' : '1';
+            pwrBtn.style.cursor = isAuto ? 'not-allowed' : 'pointer';
+        }
+    };
+
+    updateDeviceUI('fan1', 'autoFan1', 'sub-fan1', 'auto-fan1-btn', 'pwr-fan1-btn');
+    updateDeviceUI('fan2', 'autoFan2', 'sub-fan2', 'auto-fan2-btn', 'pwr-fan2-btn');
+    updateDeviceUI('heatlight', 'autoHeat', 'sub-heatlight', 'auto-heatlight-btn', 'pwr-heatlight-btn');
+    updateDeviceUI('nightlight', 'autoNightLight', 'sub-nightlight', 'auto-nightlight-btn', 'pwr-nightlight-btn');
+
+    const pumpBtn = document.getElementById('pump-btn');
+    if (pumpBtn) {
+        pumpBtn.classList.toggle('on', !!data.pump);
+        pumpBtn.innerText = data.pump ? 'PUMP RUNNING' : 'START PUMP';
+    }
+
+    const subSpray = document.getElementById('sub-spray');
+    if (subSpray) subSpray.innerText = data.autoSpray ? '🤖 AUTO: HUMIDITY < 30%' : '✋ MANUAL OVERRIDE';
+    const autoSprayBtn = document.getElementById('auto-spray-btn');
+    if (autoSprayBtn) {
+        autoSprayBtn.classList.toggle('active', !!data.autoSpray);
+        autoSprayBtn.innerText = data.autoSpray ? 'Auto ON' : 'Auto OFF';
+    }
+    const sprayBtn = document.getElementById('sprayBtn');
+    if (sprayBtn && !pendingCommands.has('actuators/spray')) {
+        sprayBtn.classList.toggle('on', !!data.spray);
+        sprayBtn.innerText = data.spray ? '💦 SPRAYING (3 CLICKS)...' : 'Click Manual Water SPRAY';
+        sprayBtn.disabled = !!data.spray;
+    }
+
+    const subCurtain = document.getElementById('sub-curtain');
+    if (subCurtain) subCurtain.innerText = data.autoCurtain ? '🤖 AUTO MODE ACTIVE' : '✋ MANUAL OVERRIDE';
+    const autoCurtainBtn = document.getElementById('auto-curtain-btn');
+    if (autoCurtainBtn) {
+        autoCurtainBtn.classList.toggle('active', !!data.autoCurtain);
+        autoCurtainBtn.innerText = data.autoCurtain ? 'Auto ON' : 'Auto OFF';
+    }
+    const curtainOpenBtn = document.getElementById('curtain-open-btn');
+    const curtainCloseBtn = document.getElementById('curtain-close-btn');
+    if (curtainOpenBtn && curtainCloseBtn) {
+        curtainOpenBtn.disabled = !!data.autoCurtain;
+        curtainCloseBtn.disabled = !!data.autoCurtain;
+        curtainOpenBtn.style.opacity = data.autoCurtain ? '0.5' : '1';
+        curtainCloseBtn.style.opacity = data.autoCurtain ? '0.5' : '1';
+        curtainOpenBtn.classList.toggle('on', data.curtainStatus === 1);
+        curtainCloseBtn.classList.toggle('on', data.curtainStatus === 0);
+    }
+}
+
+// ─── ROBUST ERROR-HANDLED COMMAND DISPATCHERS ───────────────────────
 window.toggleFirebaseFlag = async (path, value, btnElement, type) => {
     try {
-        // 1. Lock command to prevent onValue overwriting UI during network transit
         pendingCommands.add(path);
 
-        // 2. OPTIMISTIC UI UPDATE: Immediately change button style & text (0ms delay)
         if (btnElement) {
             btnElement.disabled = true;
             if (type === 'auto') {
                 btnElement.classList.toggle('active', value);
                 btnElement.innerText = value ? 'Auto ON' : 'Auto OFF';
-                // If turning Auto ON, disable the companion PWR button visually
-                const pwrBtn = btnElement.nextElementSibling;
-                if (pwrBtn) { pwrBtn.disabled = value; pwrBtn.style.opacity = value ? '0.5' : '1'; }
             } else if (type === 'pwr') {
                 btnElement.classList.toggle('on', value);
                 btnElement.innerText = value ? 'PWR ON' : 'PWR OFF';
@@ -439,63 +674,73 @@ window.toggleFirebaseFlag = async (path, value, btnElement, type) => {
             }
         }
 
-        // 3. Dispatch to Firebase Cloud
         const updates = {};
         updates[`/FarmData/${path}`] = value;
+        
         await update(ref(db), updates);
         
         if (path.startsWith('actuators/') && path !== 'actuators/pump' && path !== 'actuators/spray') {
-            const autoKey = path.replace('actuators/', 'auto').replace('heatlight', 'Heat').replace('nightlight', 'NightLight').replace('led', 'LED').replace('fan1', 'Fan1').replace('fan2', 'Fan2');
+            const autoKey = path.replace('actuators/', 'auto').replace('heatlight', 'Heat').replace('nightlight', 'NightLight').replace('fan1', 'Fan1').replace('fan2', 'Fan2');
             const autoUpdates = {};
             autoUpdates[`/FarmData/automation/${autoKey}`] = false;
             await update(ref(db), autoUpdates);
         }
         
-        showToast(`Command sent: ${path.split('/')[1]} ➔ ${value ? 'ON' : 'OFF'}`);
-        addLog(`Manual Override: Set ${path.split('/')[1]} to ${value ? 'ON' : 'OFF'}`);
+        showToast(`Command Sent: ${path.split('/')[1]} ➔ ${value ? 'ON' : 'OFF'}`);
+        addLog(`Manual Command: Set ${path.split('/')[1]} to ${value ? 'ON' : 'OFF'}`);
 
-        // 4. Release lockout after 1.5s (gives ESP32 time to sync hardware)
         setTimeout(() => {
             pendingCommands.delete(path);
             if (btnElement) btnElement.disabled = false;
-        }, 1500);
+        }, 1200);
 
     } catch (error) {
         pendingCommands.delete(path);
         if (btnElement) btnElement.disabled = false;
-        showToast("Error sending command to cloud!", true);
+        
+        // Fail / Error Message UI Feedback
+        const failMessage = `❌ Command Failed: Unable to update ${path.split('/')[1]} (${error.message || 'Network Error'})`;
+        showToast(failMessage, true);
+        addLog(`❌ Command Execution Failure: [${path}] ${error.message || 'Check connection'}`);
+        
+        // Revert controls
+        updateDeviceControls(currentActuatorData);
     }
 };
 
-// 🟢 INSTANT MOMENTARY SPRAY TRIGGER
 window.triggerWaterSprayServo = async (btnElement) => {
+    const btn = btnElement || document.getElementById('sprayBtn');
     try {
-        const btn = btnElement || document.getElementById('sprayBtn');
         pendingCommands.add('actuators/spray');
 
-        // Optimistic UI change
         if (btn) {
             btn.classList.add('on');
-            btn.innerText = "💦 SPRAYING...";
+            btn.innerText = "💦 SPRAYING (3 CLICKS)...";
             btn.disabled = true;
         }
         
         await update(ref(db), { "/FarmData/actuators/spray": true });
-        showToast("💦 Triggering Water Spray Servo (30°)...");
-        addLog("Actuator Trigger: Water Spray Servo Pulsed (0° ➔ 30° ➔ 0°)");
+        showToast("💦 Pulsing Water Spray Servo (3 Clicks)...");
+        addLog("Actuator Trigger: Water Spray Servo Pulsed (3 Rapid Clicks)");
 
-        // Release UI after 2.5 seconds (covers ESP32 physical rotation time)
         setTimeout(() => {
             pendingCommands.delete('actuators/spray');
             if (btn) {
                 btn.classList.remove('on');
-                btn.innerText = "⚡ TRIGGER SPRAY";
+                btn.innerText = "Click Manual Water SPRAY";
                 btn.disabled = false;
             }
         }, 2500);
+
     } catch (error) {
         pendingCommands.delete('actuators/spray');
-        showToast("Failed to trigger Water Spray Servo!", true);
+        if (btn) {
+            btn.classList.remove('on');
+            btn.innerText = "Click Manual Water SPRAY";
+            btn.disabled = false;
+        }
+        showToast(`❌ Water Spray Servo Command Failed! (${error.message || 'Network Disconnected'})`, true);
+        addLog(`❌ Command Error: Water spray trigger failed.`);
     }
 };
 
@@ -503,7 +748,6 @@ window.setCurtainState = async (targetState, btnElement) => {
     try {
         pendingCommands.add('actuators/curtainStatus');
         
-        // Optimistic UI change
         if (btnElement) {
             const siblings = btnElement.parentElement.querySelectorAll('button');
             siblings.forEach(b => b.classList.remove('on'));
@@ -514,13 +758,16 @@ window.setCurtainState = async (targetState, btnElement) => {
             "/FarmData/automation/autoCurtain": false,
             "/FarmData/actuators/curtainStatus": targetState
         });
-        showToast(`Curtain motor triggered: ${targetState === 1 ? 'OPENING' : 'CLOSING'}`);
+        showToast(`Curtain Motor Triggered: ${targetState === 1 ? 'OPENING' : 'CLOSING'}`);
         addLog(`Actuator Trigger: Curtains set to ${targetState === 1 ? 'OPEN' : 'CLOSED'}`);
 
-        setTimeout(() => pendingCommands.delete('actuators/curtainStatus'), 2000);
+        setTimeout(() => pendingCommands.delete('actuators/curtainStatus'), 1500);
+
     } catch (error) {
         pendingCommands.delete('actuators/curtainStatus');
-        showToast("Failed to drive curtain motor!", true);
+        showToast(`❌ Curtain Motor Command Failed! (${error.message || 'Cloud Sync Error'})`, true);
+        addLog(`❌ Command Failure: Curtain motor operation unsuccessful.`);
+        updateDeviceControls(currentActuatorData);
     }
 };
 
@@ -577,9 +824,41 @@ function updateCharts(temp, hum, light, gas) {
     envChart.update('none');
 }
 
+// ─── ESP32 DISCONNECTION / OFFLINE WATCHDOG ───────────────────────────
+function handleESP32OfflineState() {
+    if (isEsp32CurrentlyOffline) return;
+    isEsp32CurrentlyOffline = true;
+
+    const led = document.getElementById('conn-led');
+    const label = document.getElementById('conn-label');
+
+    if (led) led.className = 'led-dot offline';
+    if (label) label.innerText = 'ESP32 Offline / Disconnected ⚠️';
+
+    // Set website sensor display to 0
+    renderSensors({ temp: 0, hum: 0, rain: 0, gas: 0, light: 0 });
+
+    if (alertArea) {
+        alertArea.style.display = 'block';
+        alertArea.innerHTML = `⚠️ <strong>SYSTEM ALERT:</strong> ESP32 hardware lost connection! Sensor display reset to 0.`;
+    }
+
+    showToast("⚠️ ESP32 disconnected! Sensor values reset to 0.", true);
+    addLog("⚠️ System Alert: ESP32 telemetry lost. Sensor values defaulted to 0.");
+}
+
 function initFirebaseListener() {
     const farmDataRef = ref(db, '/FarmData');
     
+    // Watchdog check every 2 seconds: if no data received for 5 seconds -> set sensors to 0
+    if (!offlineWatchdogTimer) {
+        offlineWatchdogTimer = setInterval(() => {
+            if (lastDataReceivedTimestamp > 0 && (Date.now() - lastDataReceivedTimestamp > 5000)) {
+                handleESP32OfflineState();
+            }
+        }, 2000);
+    }
+
     onValue(farmDataRef, (snapshot) => {
         const val = snapshot.val();
         const led = document.getElementById('conn-led');
@@ -588,9 +867,16 @@ function initFirebaseListener() {
         const cmdEl = document.getElementById('stat-cmds');
 
         if (!val) {
-            if (led) led.className = 'led-dot offline';
-            if (label) label.innerText = 'Offline / No Data';
+            handleESP32OfflineState();
             return;
+        }
+
+        // ESP32 is actively sending data
+        lastDataReceivedTimestamp = Date.now();
+        if (isEsp32CurrentlyOffline) {
+            isEsp32CurrentlyOffline = false;
+            showToast("⚡ ESP32 Connection Re-established!");
+            addLog("System Status: ESP32 re-connected to cloud.");
         }
 
         if (led) led.className = 'led-dot live';
@@ -613,6 +899,10 @@ function initFirebaseListener() {
             ...(val.automation || {})
         };
 
+        if (val.power) {
+            updatePowerUI(val.power);
+        }
+
         renderSensors(sensorData);
         updateDeviceControls(mergedActuatorData);
         updateCharts(sensorData.temp, sensorData.hum, sensorData.light, sensorData.gas);
@@ -626,24 +916,30 @@ function initFirebaseListener() {
         if (alertArea) {
             if (sensorData.gas > 2500) {
                 alertArea.style.display = 'block';
-                alertArea.innerHTML = `⚠️ CRITICAL ALERT: High Gas Concentration Detected (${sensorData.gas} ppm)! Exhaust fans engaged.`;
-            } else {
+                alertArea.innerHTML = `⚠️ CRITICAL ALERT: High Gas Concentration (${sensorData.gas} ppm)! Exhaust fans engaged.`;
+                
+                const now = Date.now();
+                if (now - lastAudioAlertTime > 3000) {
+                    playBeep(950, 0.4);
+                    lastAudioAlertTime = now;
+                }
+            } else if (!isEsp32CurrentlyOffline) {
                 alertArea.style.display = 'none';
             }
         }
     }, (error) => {
-        const led = document.getElementById('conn-led');
-        if (led) led.className = 'led-dot offline';
-        showToast("Connection lost to Firebase!", true);
+        handleESP32OfflineState();
+        showToast(`❌ Cloud Listener Failed: ${error.message}`, true);
     });
 }
 
 window.addEventListener('DOMContentLoaded', () => {
     initAuthSystem();
+    initAudioSystem();
     initNavigation();
     initTheme();
     initCharts();
-    loadPowerSystem();
+    initActuatorsPanelOnce();
     loadHistoricalRecords();
     
     addLog("Dashboard initialized. Waiting for Admin authentication...");
