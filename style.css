@@ -58,7 +58,7 @@ body {
 }
 
 .login-header { text-align: center; margin-bottom: 25px; }
-.login-header h2 { font-size: 1.6rem; color: var(--accent); margin-bottom: 8px; }
+.login-header h2 { font-size: 1.4rem; color: var(--accent); margin-bottom: 8px; word-break: break-word; }
 .login-header p { font-size: 0.85rem; color: var(--text-muted); }
 
 .form-group { margin-bottom: 18px; }
@@ -88,7 +88,7 @@ body {
     border-bottom: 1px solid var(--card-border); flex-wrap: wrap; gap: 15px;
 }
 
-.logo { font-size: 1.3rem; font-weight: 800; color: var(--text-main); cursor: pointer; display: flex; align-items: center; gap: 6px; }
+.logo { font-size: 1.2rem; font-weight: 800; color: var(--text-main); cursor: pointer; display: flex; align-items: center; gap: 6px; }
 .logo span { background: var(--accent); color: white; padding: 2px 8px; border-radius: 6px; font-size: 0.75rem; }
 
 .nav-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -105,9 +105,27 @@ body {
 .logout-btn { background: rgba(239, 68, 68, 0.1); color: var(--danger); border-color: transparent; }
 .logout-btn:hover { background: var(--danger); color: white; }
 
+/* Audio Alarm Active State Indicator */
+#alarmSoundBtn.active {
+    background: rgba(239, 68, 68, 0.2);
+    color: var(--danger);
+    border-color: var(--danger);
+    animation: pulse 1.5s infinite;
+}
+
+#exportCsvBtn {
+    background: rgba(16, 185, 129, 0.15);
+    border-color: var(--success);
+    color: var(--success);
+}
+#exportCsvBtn:hover {
+    background: var(--success);
+    color: white;
+}
+
 .admin-badge { display: flex; align-items: center; gap: 10px; font-size: 0.85rem; font-weight: 600; padding-left: 5px; }
 
-/* ─── STATUS STRIP ──────────────────────────────────────────────── */
+/* ─── STATUS STRIP & DUAL POWER TIMER BADGES ────────────────────── */
 .status-strip {
     display: flex; justify-content: flex-start; align-items: center;
     padding: 10px 25px; background: rgba(30, 41, 59, 0.5);
@@ -120,12 +138,31 @@ body {
 .led-dot.offline { background: var(--danger); }
 
 .power-btn {
-    padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 0.75rem;
-    border: none; cursor: pointer; transition: transform 0.1s;
+    padding: 6px 14px; border-radius: 8px; font-weight: 700; font-size: 0.8rem;
+    border: none; cursor: default; transition: transform 0.1s;
 }
 .power-btn.solar { background: var(--solar); color: #000; }
 .power-btn.ac { background: var(--ac); color: #fff; }
-.power-btn:active { transform: scale(0.95); }
+
+.solar-timer-badge {
+    background: rgba(234, 179, 8, 0.15);
+    border: 1px solid var(--solar);
+    color: var(--solar);
+    padding: 5px 12px;
+    border-radius: 8px;
+    font-size: 0.8rem;
+    font-weight: 600;
+}
+
+.ac-timer-badge {
+    background: rgba(168, 85, 247, 0.15);
+    border: 1px solid var(--ac);
+    color: var(--ac);
+    padding: 5px 12px;
+    border-radius: 8px;
+    font-size: 0.8rem;
+    font-weight: 600;
+}
 
 /* ─── PAGE LAYOUT & SECTION BLOCKS ──────────────────────────────── */
 .page-view { display: none; padding: 25px; max-width: 1400px; margin: 0 auto; }
@@ -181,7 +218,7 @@ body {
 .progress-bar { width: 100%; height: 6px; background: rgba(0,0,0,0.2); border-radius: 3px; overflow: hidden; }
 .progress-fill { height: 100%; transition: width 0.4s ease, background-color 0.4s ease; }
 
-/* ─── TACTILE ACTUATOR DEVICE CARDS & BUTTONS ───────────────────── */
+/* ─── TACTILE ACTUATOR DEVICE CARDS & INSTANT BUTTONS ───────────── */
 .device-item {
     background: var(--card-bg);
     border: 1px solid var(--card-border);
@@ -207,7 +244,6 @@ body {
 
 .button-group { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; flex-shrink: 0; }
 
-/* Snap-action buttons with instant touch feedback */
 .ctrl-btn, .pump-btn, .danger-btn, .link-btn {
     padding: 10px 16px;
     border-radius: 10px;
@@ -217,7 +253,7 @@ body {
     background: transparent;
     color: var(--text-main);
     cursor: pointer;
-    transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
     min-height: 42px;
     display: inline-flex;
     align-items: center;
@@ -228,7 +264,6 @@ body {
 
 .ctrl-btn:active, .pump-btn:active, .danger-btn:active {
     transform: scale(0.94);
-    box-shadow: inset 0 2px 4px rgba(0,0,0,0.4);
 }
 
 .ctrl-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
@@ -275,7 +310,6 @@ body {
     .status-strip { padding: 12px 15px; gap: 12px; }
     .page-view { padding: 15px; }
     
-    /* Make buttons expand for thumbs on phones */
     .device-item { flex-direction: column; align-items: stretch; }
     .button-group { width: 100%; justify-content: stretch; margin-top: 8px; }
     .button-group button { flex: 1; }
